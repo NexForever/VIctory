@@ -122,10 +122,15 @@ impl Inst {
 /// The first user SGPR that the spill table of root arguments stands for.
 const SPILL_FIRST: u8 = 16;
 
-/// Rewrites loads from the spill table (`s[0:1]`, the high dword masked to a
-/// 40-bit address, usually through copies in `s2`/`s3`) into `s_mov_b32` from
-/// the user SGPRs the table's dwords stand for. Only loads with a constant
-/// offset, in code no branch joins after the pointer is set up, are rewritten.
+/// Rewrites loads from the assumed spill table in `s[0:1]`, usually through
+/// copies in `s2`/`s3`, into `s_mov_b32` from the user SGPRs its dwords stand for.
+/// Pointer tracking assumes a normalized 40-bit address (high dword <= 0xff).
+/// Neither this pass nor the layout/system-SGPR gate proves that convention.
+/// For a hypothetical 48-bit address, masking its high dword 0x100 with 0xff,
+/// or 0x8000 with 0x7fff, changes the address: both results are zero. These
+/// counterexamples do not establish the console ABI.
+/// Only constant-offset loads are considered. Pointer provenance is cleared
+/// at every branch target.
 ///
 /// The table holds the arguments as they were on entry, but the program may
 /// have written the SGPRs those dwords stand for by the time it loads them
@@ -182,7 +187,8 @@ fn spill_loads(
     let original = list.clone();
     // Where each rewritten copy is in `out`, and the user SGPR it stands for.
     let mut copies: Vec<(usize, u8)> = Vec::new();
-    // 1: a copy of s0, 2: a copy of s1 (masked to the address's high bits).
+    // 1: a copy of s0, 2: a copy of s1 under the address assumption above.
+    // Tag 2 is assigned on entry, before any normalization is observed.
     let mut tag = [0u8; 128];
     tag[0] = 1;
     tag[1] = 2;
@@ -241,10 +247,11 @@ fn spill_loads(
                         },
                         ("s_and_b32", [x, y]) => {
                             // `s1 & mask` with a small mask, either way round.
-                            // The high dword's eight low bits are address bits
-                            // (40-bit addresses): a mask clearing any of them
-                            // can point elsewhere, so it drops the tag. No
-                            // inline constant (1..=64) keeps them all.
+                            // Under the assumed 40-bit convention, all eight
+                            // low bits of the high dword may be address bits.
+                            // Clearing any can point elsewhere. This condition
+                            // is insufficient for a wider address domain.
+                            // No inline integer in 0..=64 preserves all eight.
                             let masked = |reg: &Operand, mask: &Operand| match (scalar(reg), mask) {
                                 (Some((c, _)), Operand::Literal(m)) => {
                                     tag[c as usize] == 2 && *m <= 0xFFFF && *m & 0xFF == 0xFF
@@ -329,6 +336,8 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
 /// [`build`]; with `spilled`, loads from the root-argument spill table that
 /// `s[0:1]` points to read the user SGPRs the table stands for (table dword
 /// `k` is user SGPR `16 + k`), as plain register copies.
+/// Enabling this assumes the 40-bit spill-pointer convention described in
+/// `spill_loads`; this API does not validate the pointer's width or value.
 pub fn build_with(
     code: &[u8],
     wave64: bool,
@@ -1293,6 +1302,200 @@ mod tests {
         assert_eq!(loads_left(0xFFFF, false), 0);
         assert_eq!(loads_left(0xFFFE, false), 1);
         assert_eq!(loads_left(0x1_00FF, false), 1);
+    }
+
+    fn synthetic_spill_and(dst: u8, src: u8, mask: u32, reversed: bool) -> [u32; 2] {
+        let (src0, src1) = if reversed { (255, src) } else { (src, 255) };
+        [
+            0x8700_0000 | u32::from(dst) << 16 | u32::from(src1) << 8 | u32::from(src0),
+            mask,
+        ]
+    }
+
+    // Synthetic sequences only. Offset 0x10 selects table dwords 4..7,
+    // represented here by the entry values of physical SGPRs 20..23.
+    // The disabled-rule control checks that the decoder really saw a load.
+    fn check_spill_sequence(prefix: &[u32], base: u8, rewrite: bool) {
+        assert_eq!(base % 2, 0);
+        let mut words = prefix.to_vec();
+        words.extend([0xF408_0200 | u32::from(base / 2), 0xFA00_0010, S_ENDPGM]);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        for wave64 in [false, true] {
+            for spilled in [false, true] {
+                let p = build_with(&code, wave64, 256, spilled).unwrap();
+                let rewritten = spilled && rewrite;
+                let insts: Vec<_> = p.blocks.iter().flat_map(|b| &b.insts).collect();
+                assert_eq!(
+                    insts
+                        .iter()
+                        .filter(|i| i.name() == "s_load_dwordx4")
+                        .count(),
+                    usize::from(!rewritten),
+                    "wave64={wave64}, spilled={spilled}, prefix={prefix:x?}",
+                );
+                if !rewritten {
+                    let at = insts
+                        .iter()
+                        .position(|i| i.name() == "s_load_dwordx4")
+                        .unwrap();
+                    let load = insts[at];
+                    let Fields::Smem {
+                        data,
+                        base: address,
+                        offset,
+                        soffset,
+                        ..
+                    } = &load.fields
+                    else {
+                        panic!("expected scalar memory fields");
+                    };
+                    assert_eq!(*data, Some(Operand::Scalar { code: 8, dwords: 4 }));
+                    assert_eq!(
+                        *address,
+                        Operand::Scalar {
+                            code: base,
+                            dwords: 2
+                        }
+                    );
+                    assert_eq!(*offset, 0x10);
+                    assert_eq!(
+                        *soffset,
+                        Operand::Scalar {
+                            code: 125,
+                            dwords: 1
+                        }
+                    );
+                    assert_eq!(load.machine.offset, prefix.len() * 4);
+                    // Each half must read the latest definition in the prefix,
+                    // not an input or a superseded value of that register.
+                    let expected_reads: Vec<_> = (base..base + 2)
+                        .map(|r| {
+                            let reg = Reg::S(r);
+                            let value = insts[..at]
+                                .iter()
+                                .rev()
+                                .find_map(|i| i.write(reg))
+                                .expect("pointer half defined by the synthetic prefix");
+                            (reg, value)
+                        })
+                        .collect();
+                    assert_eq!(load.reads, expected_reads);
+                    assert_eq!(
+                        load.writes.iter().map(|w| w.0).collect::<Vec<_>>(),
+                        (8..12).map(Reg::S).collect::<Vec<_>>()
+                    );
+                }
+                for k in 0..4 {
+                    let source = p.inputs.iter().find(|i| i.0 == Reg::S(20 + k));
+                    assert_eq!(source.is_some(), rewritten);
+                    if let Some(&(_, entry)) = source {
+                        let mut value = insts
+                            .iter()
+                            .rev()
+                            .find_map(|i| i.write(Reg::S(8 + k)))
+                            .expect("load destination written");
+                        // Follow the load replacement and its entry snapshot,
+                        // without depending on the scratch register chosen.
+                        for _ in 0..insts.len() {
+                            if value == entry {
+                                break;
+                            }
+                            let copy = insts
+                                .iter()
+                                .find(|i| {
+                                    i.name() == "s_mov_b32" && i.writes.iter().any(|w| w.1 == value)
+                                })
+                                .expect("a copy of the original table argument");
+                            value = copy.reads.first().expect("copy source").1;
+                        }
+                        assert_eq!(value, entry, "s{} must read entry s{}", 8 + k, 20 + k);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spill_mask_reversed_operands_and_in_place() {
+        for reversed in [false, true] {
+            for in_place in [false, true] {
+                for mask in [0, 1, 0x7f, 0xff] {
+                    let mut words = vec![0xBE82_0300]; // s2 <- s0
+                    let src = if in_place {
+                        words.push(0xBE83_0301); // s3 <- s1
+                        3
+                    } else {
+                        1
+                    };
+                    words.extend(synthetic_spill_and(3, src, mask, reversed));
+                    let code: Vec<u8> = words
+                        .iter()
+                        .chain([&S_ENDPGM])
+                        .flat_map(|w| w.to_le_bytes())
+                        .collect();
+                    let decoded = gfx10::decode(&code).unwrap();
+                    let and = &decoded[decoded.len() - 2];
+                    assert_eq!(and.name(), Some("s_and_b32"));
+                    let register = Operand::Scalar {
+                        code: src,
+                        dwords: 1,
+                    };
+                    let literal = Operand::Literal(mask);
+                    let expected = if reversed {
+                        vec![literal, register]
+                    } else {
+                        vec![register, literal]
+                    };
+                    for wave64 in [false, true] {
+                        assert_eq!(
+                            and.fields(wave64),
+                            Fields::Sop {
+                                dst: Some(Operand::Scalar { code: 3, dwords: 1 }),
+                                src: expected.clone(),
+                                imm: None,
+                            },
+                            "reversed={reversed}, in_place={in_place}, mask={mask:#x}"
+                        );
+                    }
+                    check_spill_sequence(&words, 2, mask == 0xff);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spill_mask_pointer_copies_preserve_or_drop_provenance() {
+        for mask in [1, 0x7f, 0xff] {
+            let mut words = vec![0xBE82_0300]; // s2 <- s0
+            words.extend(synthetic_spill_and(3, 1, mask, false));
+            words.extend([
+                0xBE84_0302, // s4 <- s2
+                0xBE85_0303, // s5 <- s3
+                0xBE86_0304, // s6 <- s4
+                0xBE87_0305, // s7 <- s5
+                0xBE80_0380, // s0 <- 0: copies must survive overwriting the input pair
+                0xBE81_0380, // s1 <- 0
+                0xBE82_0380, // s2 <- 0: must not invalidate the copies
+                0xBE83_0380, // s3 <- 0
+            ]);
+            check_spill_sequence(&words, 6, mask == 0xff);
+        }
+    }
+
+    #[test]
+    fn spill_mask_chains_do_not_restore_lost_provenance() {
+        for (masks, rewrite) in [
+            ([0xffff, 0xff], true),
+            ([0xff, 0x1ff], true),
+            ([0xff, 0x7f], false),
+            ([0x7f, 0xff], false),
+            ([1, 0xff], false),
+        ] {
+            let mut words = vec![0xBE82_0300];
+            words.extend(synthetic_spill_and(3, 1, masks[0], false));
+            words.extend(synthetic_spill_and(3, 3, masks[1], true));
+            check_spill_sequence(&words, 2, rewrite);
+        }
     }
 
     /// A compute program whose root arguments are in the spill table `s[0:1]`
