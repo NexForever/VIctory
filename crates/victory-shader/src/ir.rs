@@ -211,13 +211,13 @@ fn spill_loads(
                             _ => 0,
                         },
                         ("s_and_b32", [x, y]) => {
-                            // `s1 & mask` with a small mask, either way round.
+                            // All eight low bits of the high dword belong to
+                            // the 40-bit address. A mask that clears any of
+                            // them can point elsewhere, so drop its provenance.
+                            // No positive inline constant (0..64) preserves them.
                             let masked = |reg: &Operand, mask: &Operand| match (scalar(reg), mask) {
                                 (Some((c, _)), Operand::Literal(m)) => {
-                                    tag[c as usize] == 2 && *m <= 0xFFFF
-                                }
-                                (Some((c, _)), Operand::Const(k)) => {
-                                    tag[c as usize] == 2 && (129..=192).contains(k)
+                                    tag[c as usize] == 2 && *m <= 0xFFFF && *m & 0xFF == 0xFF
                                 }
                                 _ => false,
                             };
@@ -1219,6 +1219,73 @@ mod tests {
 
     fn input(p: &Program, reg: Reg) -> Value {
         p.inputs.iter().find(|i| i.0 == reg).expect("input").1
+    }
+
+    // Synthetic pointer arithmetic only: no shader or address from a title.
+    // Under the recognized 40-bit convention, all eight low bits of the
+    // high dword are address bits. Losing even one can select another table.
+    fn check_spill_mask(mask: u32, inline: bool, rewrite: bool) {
+        let preserves_address = (0..=0xffu32).all(|high| high & mask == high);
+        assert_eq!(preserves_address, rewrite);
+        let mut words = vec![0xBE82_0300u32]; // s_mov_b32 s2, s0
+        if inline {
+            assert!(mask <= 64);
+            words.push(0x8703_0001 | ((128 + mask) << 8)); // s_and_b32 s3, s1, inline
+        } else {
+            words.extend([0x8703_FF01, mask]); // s_and_b32 s3, s1, literal
+        }
+        words.extend([0xF408_0201, 0xFA00_0010, S_ENDPGM]); // load x4 at byte 0x10
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = build_with(&code, false, 256, true).unwrap();
+        let loads = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| i.name() == "s_load_dwordx4")
+            .count();
+        assert_eq!(
+            loads,
+            usize::from(!rewrite),
+            "mask {mask:#x}, inline={inline}"
+        );
+        for k in 20..24 {
+            assert_eq!(p.inputs.iter().any(|i| i.0 == Reg::Spill(k)), rewrite);
+        }
+    }
+
+    #[test]
+    fn spill_mask_7f_changes_address() {
+        check_spill_mask(0x7f, false, false);
+    }
+
+    #[test]
+    fn spill_mask_one_changes_address() {
+        check_spill_mask(1, true, false);
+    }
+
+    #[test]
+    fn spill_mask_literal_one_changes_address() {
+        check_spill_mask(1, false, false);
+    }
+
+    #[test]
+    fn spill_mask_ff_preserves_address() {
+        check_spill_mask(0xff, false, true);
+    }
+
+    #[test]
+    fn spill_mask_preserves_every_address_bit() {
+        for mask in 0..=0xff {
+            check_spill_mask(mask, false, mask == 0xff);
+            if mask <= 64 {
+                check_spill_mask(mask, true, false);
+            }
+        }
+        // Preserve existing support for wider masks, but not wider masks
+        // that still erase one of the address bits.
+        check_spill_mask(0x1ff, false, true);
+        check_spill_mask(0xffff, false, true);
+        check_spill_mask(0xfffe, false, false);
     }
 
     /// A compute program whose root arguments are in the spill table `s[0:1]`
